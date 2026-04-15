@@ -35,6 +35,7 @@
 #include "ray/gcs/pubsub_handler.h"
 #include "ray/gcs/runtime_env_handler.h"
 #include "ray/gcs/usage_stats_client.h"
+#include "ray/gcs/leader_election/leader_election_client_interface.h"
 #include "ray/observability/metric_interface.h"
 #include "ray/observability/ray_event_recorder.h"
 #include "ray/pubsub/gcs_publisher.h"
@@ -71,6 +72,9 @@ struct GcsServerConfig {
   // This includes the config list of raylet.
   std::string raylet_config_list;
   std::string session_name;
+  uint32_t gcs_polling_interval_ms = 500;
+  std::string gcs_leader_lease_name;
+  std::string gcs_leader_lease_namespace;
 };
 
 class GcsNodeManager;
@@ -220,6 +224,20 @@ class GcsServer {
   /// Gets the type of KV storage to use from config.
   StorageType GetStorageType() const;
 
+ protected:
+
+
+ private:
+
+  /// Load GCS tables data asynchronously.
+  void DoStartLoading();
+
+  /// Deferred loading of GCS tables data after promoting.
+  void DoStartLoadingDeferred();
+
+  /// Start the asynchronous background loop for leader election polling.
+  void StartLeaderElectionPolling();
+
   /// Print debug info periodically.
   void PrintDebugState() const;
 
@@ -319,6 +337,11 @@ class GcsServer {
   std::function<void(int)> port_ready_callback_;
   /// Client to call a metrics agent gRPC server.
   std::unique_ptr<rpc::MetricsAgentClient> metrics_agent_client_;
+
+  /// Generic client for distributed lock/lease management.
+  std::unique_ptr<LeaderLeaseClientInterface> lease_client_;
+  /// Background thread dedicated to synchronous HTTP lock polling.
+  std::unique_ptr<std::thread> lease_thread_;
 };
 
 }  // namespace gcs

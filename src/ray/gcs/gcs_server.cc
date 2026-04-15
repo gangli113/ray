@@ -13,12 +13,14 @@
 // limitations under the License.
 
 #include "ray/gcs/gcs_server.h"
+#include "ray/gcs/leader_election/leader_election_client_factory.h"
 
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/time/time.h"
 #include "ray/common/asio/asio_util.h"
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/ray_config.h"
@@ -40,6 +42,7 @@
 #include "ray/pubsub/publisher.h"
 #include "ray/raylet_rpc_client/raylet_client.h"
 #include "ray/rpc/authentication/authentication_token_loader.h"
+#include "ray/rpc/authentication/k8s_util.h"
 #include "ray/stats/stats.h"
 #include "ray/util/network_util.h"
 
@@ -215,6 +218,98 @@ GcsServer::GcsServer(const ray::gcs::GcsServerConfig &config,
 GcsServer::~GcsServer() { Stop(); }
 
 void GcsServer::Start() {
+  if (!config_.gcs_leader_lease_name.empty()) {
+    RAY_LOG(INFO) << "Starting in Shadow mode, polling K8s Lease: " 
+                  << config_.gcs_leader_lease_namespace << "/" << config_.gcs_leader_lease_name;
+    
+    rpc::k8s::InitK8sClientConfig();
+    
+    InitKVManager();
+    auto empty_gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
+    
+    GetOrGenerateClusterId(
+        {[this, empty_gcs_init_data](ClusterID cluster_id) {
+           rpc_server_.SetClusterId(cluster_id);
+           DoStart(*empty_gcs_init_data);
+           
+           // is_leader persists across iterations to track previous leadership state.
+           auto is_leader = std::make_shared<bool>(false);
+           // Instantiate the generic lease client via the platform-agnostic factory.
+           lease_client_ = LeaderLeaseClientFactory::Create(config_.gcs_leader_lease_namespace);
+
+
+           
+           this->StartLeaderElectionPolling();
+        },
+        io_context_provider_.GetDefaultIOContext()});
+        
+  } else {
+    DoStartLoading();
+  }
+}
+
+void GcsServer::DoStartLoadingDeferred() {
+  RAY_LOG(INFO) << "Deferred loading of GCS tables data.";
+  auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
+  gcs_init_data->AsyncLoad({[this, gcs_init_data] {
+    RAY_LOG(INFO) << "Loaded data from Redis, initializing managers.";
+    gcs_node_manager_->Initialize(*gcs_init_data);
+    gcs_resource_manager_->Initialize(*gcs_init_data);
+    gcs_job_manager_->Initialize(*gcs_init_data);
+    gcs_placement_group_manager_->Initialize(*gcs_init_data);
+    gcs_actor_manager_->Initialize(*gcs_init_data);
+    gcs_autoscaler_state_manager_->Initialize(*gcs_init_data);
+    RAY_LOG(INFO) << "GCS Shadow Head promoted and initialized.";
+  }, io_context_provider_.GetDefaultIOContext()});
+}
+
+void GcsServer::StartLeaderElectionPolling() {
+  auto is_leader = std::make_shared<bool>(false);
+  
+  // Launch the background goroutine-style loop to completely isolate blocking leader lease network I/O.
+  lease_thread_ = std::make_unique<std::thread>([this, is_leader]() {
+    SetThreadName("GcsServer.poll_leader_lease");
+    
+    const char *hostname = std::getenv("HOSTNAME");
+    std::string my_id = hostname ? hostname : "unknown";
+
+    while (!is_stopped_) {
+      bool is_leader_current = false;
+      try {
+        if (*is_leader) {
+          is_leader_current = lease_client_->Renew(config_.gcs_leader_lease_name, my_id, 10000);
+        } else {
+          is_leader_current = lease_client_->TryAcquire(config_.gcs_leader_lease_name, my_id, 10000);
+        }
+      } catch (const std::exception &e) {
+        RAY_LOG(WARNING) << "Exception occurred during leader lease poll: " << e.what();
+        is_leader_current = false;
+      }
+
+      io_context_provider_.GetDefaultIOContext().post([this, is_leader_current, is_leader]() {
+        if (is_stopped_) {
+          return;
+        }
+        if (*is_leader) {
+          if (!is_leader_current) {
+            RAY_LOG(FATAL) << "Lost leadership from Lease! Aborting to prevent split-brain.";
+          }
+          return;
+        }
+        if (is_leader_current) {
+          RAY_LOG(INFO) << "Acquired leadership from Lease, promoting GCS.";
+          *is_leader = true;
+          this->DoStartLoadingDeferred();
+        }
+      }, "GcsServer.PromoteGcs");
+
+      // Sleep for polling interval without blocking the main IO thread.
+      std::this_thread::sleep_for(std::chrono::milliseconds(config_.gcs_polling_interval_ms));
+    }
+  });
+}
+
+void GcsServer::DoStartLoading() {
   // Load gcs tables data asynchronously.
   auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
   // Init KV Manager. This needs to be initialized first here so that
@@ -230,6 +325,7 @@ void GcsServer::Start() {
                             },
                             io_context_provider_.GetDefaultIOContext()});
 }
+
 
 void GcsServer::GetOrGenerateClusterId(
     Postable<void(ClusterID cluster_id)> continuation) {
@@ -351,6 +447,10 @@ void GcsServer::Stop() {
     kv_manager_.reset();
 
     is_stopped_ = true;
+
+    if (lease_thread_ && lease_thread_->joinable()) {
+      lease_thread_->join();
+    }
 
     RAY_LOG(INFO) << "GCS server stopped.";
   }
